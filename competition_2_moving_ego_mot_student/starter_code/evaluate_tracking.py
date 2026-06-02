@@ -5,7 +5,6 @@ import csv
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 
 def is_frame_row(row_id: str) -> bool:
@@ -140,7 +139,11 @@ if __name__ == "__main__":
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame([result]).to_csv(out_path, index=False)
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(result.keys()))
+        writer.writeheader()
+        writer.writerow(result)
 
-    print(pd.DataFrame([result]).to_string(index=False))
+    print(" ".join(result.keys()))
+    print(" ".join(str(result[key]) for key in result))
     print(f"[DONE] saved: {out_path}")

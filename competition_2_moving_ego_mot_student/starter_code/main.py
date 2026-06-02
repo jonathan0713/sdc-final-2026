@@ -4,7 +4,6 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from sdc_tracker import Tracker
@@ -48,24 +47,19 @@ def calculate_cluster_centroids(
 
     # TODO-1
     # ================================ TODO: Implementation Starts Here ================================
-    #
-    # Convert each moving cluster into a detection-level representation.
-    #
-    # Suggested logic:
-    #   1. Find all unique valid cluster ids in moving_mask.
-    #      Use cluster_id >= 0 only. Negative labels such as -1 / -2
-    #      should not be converted into trackable detections.
-    #   2. For each valid cluster id:
-    #        - select its radar points from moving_radar_pc
-    #        - compute mean x, y, z as centroid
-    #        - compute mean range_rate if available
-    #        - store all cluster points
-    #
-    # Expected outputs:
-    #   cluster_centroids[cluster_id] = np.array([x, y, z])
-    #   cluster_velocities[cluster_id] = mean_range_rate
-    #   cluster_points_dict[cluster_id] = points
-    #
+    valid_cluster_ids = np.unique(moving_mask[moving_mask >= 0])
+
+    for cluster_id in valid_cluster_ids:
+        point_indices = moving_mask == cluster_id
+        points = moving_radar_pc[point_indices]
+
+        if len(points) == 0:
+            continue
+
+        cluster_id = int(cluster_id)
+        cluster_centroids[cluster_id] = points[:, :3].mean(axis=0)
+        cluster_velocities[cluster_id] = float(points[:, 3].mean()) if points.shape[1] > 3 else 0.0
+        cluster_points_dict[cluster_id] = points
     # ================================ TODO: Implementation Ends Here ================================
 
     return cluster_centroids, cluster_velocities, cluster_points_dict
@@ -89,16 +83,15 @@ def generate_cluster_track_dict(
 
     # TODO-2
     # ================================ TODO: Implementation Starts Here ================================
-    #
-    # Generate the dictionary needed by save_tracking_mask_to_csv().
-    #
-    # Suggested logic:
-    #   1. Iterate over confirmed_tracks.
-    #   2. Read cluster_id and track_id from each confirmed track.
-    #   3. Store cluster_track_dict[cluster_id] = track_id.
-    #
-    # If you design a different track output format, modify this function.
-    #
+    for track in confirmed_tracks:
+        if len(track) < 5:
+            continue
+
+        cluster_id = int(track[3])
+        track_id = int(track[4])
+
+        if cluster_id in cluster_centroids and cluster_id in cluster_points_dict:
+            cluster_track_dict[cluster_id] = track_id
     # ================================ TODO: Implementation Ends Here ================================
 
     return cluster_track_dict
@@ -119,6 +112,8 @@ def visualize_tracking(
     This function is not required for Kaggle submission.
     Students may modify it to inspect tracking behavior.
     """
+    import matplotlib.pyplot as plt
+
     output_img_folder = output_folder / "tracking_vis"
     output_img_folder.mkdir(parents=True, exist_ok=True)
 
@@ -126,16 +121,25 @@ def visualize_tracking(
 
     # TODO-3
     # ================================ TODO: Implementation Starts Here ================================
-    #
-    # Optional:
-    #   1. Plot static radar points in gray.
-    #   2. Plot moving clusters.
-    #   3. Plot confirmed track ids.
-    #   4. Plot track trajectory history.
-    #   5. Save the figure.
-    #
-    # This TODO does not affect result.csv if left empty.
-    #
+    if len(static_radar_pc) > 0:
+        ax.scatter(-static_radar_pc[:, 1], static_radar_pc[:, 0], s=6, c="0.75", alpha=0.45, label="static")
+
+    if len(moving_radar_pc) > 0:
+        for cluster_id in np.unique(moving_mask[moving_mask >= 0]):
+            points = moving_radar_pc[moving_mask == cluster_id]
+            ax.scatter(-points[:, 1], points[:, 0], s=18, alpha=0.8)
+
+    for track in confirmed_tracks:
+        x, y, _z, _cluster_id, track_id = track
+        track_id = int(track_id)
+        track_trajectories.setdefault(track_id, []).append((float(x), float(y)))
+        history = track_trajectories[track_id][-20:]
+
+        if len(history) > 1:
+            hist = np.asarray(history)
+            ax.plot(-hist[:, 1], hist[:, 0], linewidth=1.5, alpha=0.9)
+
+        ax.text(-y, x, str(track_id), fontsize=9, weight="bold")
     # ================================ TODO: Implementation Ends Here ================================
 
     ax.set_xlim(-60, 60)
@@ -163,17 +167,21 @@ def build_detections(
 
     # TODO-4
     # ================================ TODO: Implementation Starts Here ================================
-    #
-    # Convert cluster-level dictionaries into a numpy detection array.
-    #
-    # Suggested output format:
-    #   detections = np.array([
-    #       [x, y, z, cluster_id, range_rate],
-    #       ...
-    #   ])
-    #
-    # This format must match the tracker implementation.
-    #
+    for cluster_id in sorted(cluster_centroids):
+        centroid = np.asarray(cluster_centroids[cluster_id], dtype=float)
+
+        if centroid.shape[0] < 3:
+            continue
+
+        detections.append(
+            [
+                float(centroid[0]),
+                float(centroid[1]),
+                float(centroid[2]),
+                int(cluster_id),
+                float(cluster_velocities.get(cluster_id, 0.0)),
+            ]
+        )
     # ================================ TODO: Implementation Ends Here ================================
 
     if len(detections) == 0:
@@ -216,8 +224,8 @@ def run_sequence(
         print(f"ego_global_pos: {ego_pos_path}")
         print(f"ego motion steps loaded: {len(ego_motion)}")
         print(
-            "note: ego motion is loaded for students to use, but no ego compensation "
-            "is implemented in this starter code."
+            "note: ego motion is loaded; the current baseline uses radar-cluster "
+            "association without explicit ego compensation."
         )
 
     tracker = Tracker(
@@ -238,7 +246,7 @@ def run_sequence(
     print(f"max_age: {max_age}")
     print(f"min_hits: {min_hits}")
     print(f"max_distance: {max_distance}")
-    print("note: this is incomplete starter code. Implement TODO-1 to TODO-6.")
+    print("note: cluster-level tracking implementation is active.")
 
     for frame_idx, mask_name in enumerate(frame_names):
         mask, radar_pc = load_radar_and_mask_data(mask_dir, radar_dir, mask_name)
@@ -259,14 +267,7 @@ def run_sequence(
 
         # TODO-5
         # ================================ TODO: Implementation Starts Here ================================
-        #
-        # Update the tracker with current-frame detections.
-        #
-        # Suggested logic:
-        #   confirmed_tracks = tracker.update(detections)
-        #
-        # Students may also replace Tracker with their own implementation.
-        #
+        confirmed_tracks = tracker.update(detections)
         # ================================ TODO: Implementation Ends Here ================================
 
         if save_csv:
@@ -325,7 +326,7 @@ def parse_args():
     parser.add_argument("--plot-every", type=int, default=0)
 
     parser.add_argument("--max-age", type=int, default=5)
-    parser.add_argument("--min-hits", type=int, default=3)
+    parser.add_argument("--min-hits", type=int, default=1)
     parser.add_argument("--max-distance", type=float, default=5.0)
 
     return parser.parse_args()
