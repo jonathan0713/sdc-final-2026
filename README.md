@@ -47,7 +47,7 @@ python3 check_result_format.py \
 目前已產生可提交檔案：
 
 ```text
-competition_1_static_mot_student/outputs/seq_2_student_20260602_162718/result.csv
+competition_1_static_mot_student/outputs/seq_2_student_20260608_232659/result.csv
 ```
 
 ### Competition 2: Moving Ego
@@ -71,15 +71,15 @@ python3 check_result_format.py \
 目前已產生可提交檔案：
 
 ```text
-competition_2_moving_ego_mot_student/outputs/seq_4_student_20260602_162724/result.csv
+competition_2_moving_ego_mot_student/outputs/seq_4_student_20260608_232659/result.csv
 ```
 
 ## 本機驗證結果
 
 | Competition | Dev Seq | Format | MOTA-style score | FP | FN | IDSW proxy |
 |---|---:|---|---:|---:|---:|---:|
-| Static Ego | `seq_1` | OK | 0.984788 | 0 | 0 | 153 |
-| Moving Ego | `seq_3` | OK | 0.989988 | 0 | 0 | 97 |
+| Static Ego | `seq_1` | OK | 0.988666 | 0 | 0 | 114 |
+| Moving Ego | `seq_3` | OK | 0.991226 | 0 | 0 | 85 |
 
 測試集格式檢查：
 
@@ -90,15 +90,43 @@ competition_2_moving_ego_mot_student/outputs/seq_4_student_20260602_162724/resul
 
 ## 參數
 
-預設 tracker 參數：
+grid search 後的預設 tracker 參數：
 
-```text
-max_age = 5
-min_hits = 1
-max_distance = 5.0
-```
+| Competition | `max_age` | `min_hits` | `max_distance` |
+|---|---:|---:|---:|
+| Static Ego | 8 | 1 | 7.0 |
+| Moving Ego | 5 | 1 | 7.0 |
 
 `min_hits=1` 是為了避免 moving cluster 在剛出現時被標成 `-2` 而造成 missed detection。若想降低可能的 false positive，可提高 `--min-hits`，但 dev score 目前以 `1` 表現較穩。
+
+## Grid Search
+
+可用 `grid_search.py` 在 public dev 上搜尋 baseline 參數：
+
+```bash
+cd competition_1_static_mot_student/starter_code
+
+uv run --active python grid_search.py \
+  --data-root ../public_dev \
+  --seq seq_1 \
+  --output-root ../outputs
+```
+
+```bash
+cd competition_2_moving_ego_mot_student/starter_code
+
+uv run --active python grid_search.py \
+  --data-root ../public_dev \
+  --seq seq_3 \
+  --output-root ../outputs
+```
+
+summary 位置：
+
+```text
+competition_1_static_mot_student/outputs/seq_1_grid_search_20260608_232546/grid_search_summary.csv
+competition_2_moving_ego_mot_student/outputs/seq_3_grid_search_20260608_232606/grid_search_summary.csv
+```
 
 ## 互動式 Debug Viewer
 

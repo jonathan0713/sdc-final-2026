@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 public_dev/
 test_input/
+*/outputs/
