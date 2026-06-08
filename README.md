@@ -9,7 +9,7 @@
 - `Tracker.match_tracks()`: 使用 Hungarian assignment 做 track-to-detection association，並以 centroid distance gating 過濾不合理配對。
 - `Tracker.update()`: 加入簡單 constant-velocity prediction、track age 管理、新 track 建立、刪除過久未匹配 track。
 - `generate_cluster_track_dict()`: 將本幀 confirmed tracks 回填成 `{cluster_id: track_id}`，供 CSV writer 產生 point-level tracking mask。
-- `visualize_tracking()`: 支援可選雷達點與 track trajectory 視覺化。
+- `debug_tracking_viewer.py`: 支援彈窗播放 camera image + radar bird's-eye tracking，可暫停、跳格，也可選擇匯出 MP4。
 - `evaluate_tracking.py`: 改成使用標準 `csv` 輸出，避免本機 pandas/NumPy binary ABI 不相容。
 
 ## 依賴套件
@@ -22,7 +22,7 @@ matplotlib
 scipy
 ```
 
-`matplotlib` 只會在使用 `--plot-every` 時載入；一般產生 `result.csv` 不需要載入視覺化套件。
+`matplotlib` 只會在使用視覺化 viewer 或 `--plot-every` 時載入；一般產生 `result.csv` 不需要載入視覺化套件。
 
 ## 執行方式
 
@@ -99,3 +99,42 @@ max_distance = 5.0
 ```
 
 `min_hits=1` 是為了避免 moving cluster 在剛出現時被標成 `-2` 而造成 missed detection。若想降低可能的 false positive，可提高 `--min-hits`，但 dev score 目前以 `1` 表現較穩。
+
+## 互動式 Debug Viewer
+
+產生 `result.csv` 後，可以用彈窗播放對齊的相機影像與雷達 tracking。
+
+```bash
+cd competition_1_static_mot_student/starter_code
+
+PRED=$(ls -td ../outputs/seq_2_student_* | head -1)/result.csv
+
+uv run --active python debug_tracking_viewer.py \
+  --data-root ../test_input \
+  --seq seq_2 \
+  --result "$PRED" \
+  --fps 8 \
+  --tail 30
+```
+
+鍵盤控制：
+
+| Key | 功能 |
+|---|---|
+| `Space` | 暫停 / 繼續 |
+| `Left` / `Right` | 前一幀 / 下一幀 |
+| `Home` / `End` | 跳到第一幀 / 最後一幀 |
+| `Q` 或 `Esc` | 關閉 |
+
+也可以匯出影片：
+
+```bash
+uv run --active python debug_tracking_viewer.py \
+  --data-root ../test_input \
+  --seq seq_2 \
+  --result "$PRED" \
+  --save-mp4 ../outputs/seq_2_debug.mp4 \
+  --no-popup
+```
+
+MP4 匯出需要系統有 `ffmpeg`；若沒有，彈窗播放仍可使用。
