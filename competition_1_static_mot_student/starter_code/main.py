@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sdc_tracker import Tracker
+from sdc_tracker import FeatureKalmanTracker, KalmanTracker, LowPointReIDKalmanTracker, ReIDKalmanTracker, Tracker
 from sdc_tracking_utils import (
     ego_pos_distance,
     list_frame_names,
@@ -156,6 +156,7 @@ def visualize_tracking(
 def build_detections(
     cluster_centroids: dict[int, np.ndarray],
     cluster_velocities: dict[int, float],
+    cluster_points_dict: dict[int, np.ndarray] | None = None,
 ):
     """
     Build detection array for Tracker.update().
@@ -173,6 +174,21 @@ def build_detections(
         if centroid.shape[0] < 3:
             continue
 
+        points = None if cluster_points_dict is None else cluster_points_dict.get(cluster_id)
+
+        if points is not None and len(points) > 0:
+            rcs_mean = float(points[:, 4].mean()) if points.shape[1] > 4 else 0.0
+            point_count = float(len(points))
+            extents = np.ptp(points[:, :3], axis=0)
+            rr_std = float(points[:, 3].std()) if points.shape[1] > 3 else 0.0
+            rcs_std = float(points[:, 4].std()) if points.shape[1] > 4 else 0.0
+        else:
+            rcs_mean = 0.0
+            point_count = 0.0
+            extents = np.zeros(3, dtype=float)
+            rr_std = 0.0
+            rcs_std = 0.0
+
         detections.append(
             [
                 float(centroid[0]),
@@ -180,6 +196,13 @@ def build_detections(
                 float(centroid[2]),
                 int(cluster_id),
                 float(cluster_velocities.get(cluster_id, 0.0)),
+                rcs_mean,
+                point_count,
+                float(extents[0]),
+                float(extents[1]),
+                float(extents[2]),
+                rr_std,
+                rcs_std,
             ]
         )
     # ================================ TODO: Implementation Ends Here ================================
@@ -199,6 +222,7 @@ def run_sequence(
     max_age: int,
     min_hits: int,
     max_distance: float,
+    tracker_mode: str = "baseline",
 ):
     data_root = Path(data_root)
     seq_dir = data_root / seq
@@ -228,7 +252,15 @@ def run_sequence(
             "is implemented in this starter code."
         )
 
-    tracker = Tracker(
+    tracker_classes = {
+        "baseline": Tracker,
+        "kalman": KalmanTracker,
+        "kalman_feature": FeatureKalmanTracker,
+        "kalman_reid": ReIDKalmanTracker,
+        "kalman_low_point_reid": LowPointReIDKalmanTracker,
+    }
+    tracker_cls = tracker_classes[tracker_mode]
+    tracker = tracker_cls(
         max_age=max_age,
         min_hits=min_hits,
         max_distance=max_distance,
@@ -246,6 +278,7 @@ def run_sequence(
     print(f"max_age: {max_age}")
     print(f"min_hits: {min_hits}")
     print(f"max_distance: {max_distance}")
+    print(f"tracker_mode: {tracker_mode}")
     print("note: cluster-level tracking implementation is active.")
 
     for frame_idx, mask_name in enumerate(frame_names):
@@ -261,7 +294,7 @@ def run_sequence(
             moving_radar_pc,
         )
 
-        detections = build_detections(cluster_centroids, cluster_velocities)
+        detections = build_detections(cluster_centroids, cluster_velocities, cluster_points_dict)
 
         confirmed_tracks = np.empty((0, 5), dtype=float)
 
@@ -325,9 +358,14 @@ def parse_args():
     )
     parser.add_argument("--plot-every", type=int, default=0)
 
-    parser.add_argument("--max-age", type=int, default=5)
+    parser.add_argument("--max-age", type=int, default=8)
     parser.add_argument("--min-hits", type=int, default=1)
-    parser.add_argument("--max-distance", type=float, default=5.0)
+    parser.add_argument("--max-distance", type=float, default=7.0)
+    parser.add_argument(
+        "--tracker-mode",
+        choices=["baseline", "kalman", "kalman_feature", "kalman_reid", "kalman_low_point_reid"],
+        default="baseline",
+    )
 
     return parser.parse_args()
 
@@ -344,4 +382,5 @@ if __name__ == "__main__":
         max_age=args.max_age,
         min_hits=args.min_hits,
         max_distance=args.max_distance,
+        tracker_mode=args.tracker_mode,
     )

@@ -6,11 +6,12 @@ from pathlib import Path
 
 import numpy as np
 
-from sdc_tracker import Tracker
+from sdc_tracker import FeatureKalmanTracker, KalmanTracker, LowPointReIDKalmanTracker, ReIDKalmanTracker, Tracker
 from sdc_tracking_utils import (
     ego_pos_distance,
     list_frame_names,
     load_radar_and_mask_data,
+    read_ego_pos,
     save_tracking_mask_to_csv,
     separate_static_and_moving,
 )
@@ -156,6 +157,7 @@ def visualize_tracking(
 def build_detections(
     cluster_centroids: dict[int, np.ndarray],
     cluster_velocities: dict[int, float],
+    cluster_points_dict: dict[int, np.ndarray] | None = None,
 ):
     """
     Build detection array for Tracker.update().
@@ -173,6 +175,21 @@ def build_detections(
         if centroid.shape[0] < 3:
             continue
 
+        points = None if cluster_points_dict is None else cluster_points_dict.get(cluster_id)
+
+        if points is not None and len(points) > 0:
+            rcs_mean = float(points[:, 4].mean()) if points.shape[1] > 4 else 0.0
+            point_count = float(len(points))
+            extents = np.ptp(points[:, :3], axis=0)
+            rr_std = float(points[:, 3].std()) if points.shape[1] > 3 else 0.0
+            rcs_std = float(points[:, 4].std()) if points.shape[1] > 4 else 0.0
+        else:
+            rcs_mean = 0.0
+            point_count = 0.0
+            extents = np.zeros(3, dtype=float)
+            rr_std = 0.0
+            rcs_std = 0.0
+
         detections.append(
             [
                 float(centroid[0]),
@@ -180,6 +197,13 @@ def build_detections(
                 float(centroid[2]),
                 int(cluster_id),
                 float(cluster_velocities.get(cluster_id, 0.0)),
+                rcs_mean,
+                point_count,
+                float(extents[0]),
+                float(extents[1]),
+                float(extents[2]),
+                rr_std,
+                rcs_std,
             ]
         )
     # ================================ TODO: Implementation Ends Here ================================
@@ -188,6 +212,36 @@ def build_detections(
         return np.empty((0, 5), dtype=float)
 
     return np.asarray(detections, dtype=float)
+
+
+def apply_ego_translation_compensation(
+    detections: np.ndarray,
+    ego_positions: np.ndarray,
+    frame_idx: int,
+    ego_mode: str,
+) -> np.ndarray:
+    if ego_mode == "none" or len(detections) == 0:
+        return detections
+
+    if frame_idx >= len(ego_positions):
+        return detections
+
+    compensated = detections.copy()
+    ego_x, ego_y = ego_positions[frame_idx, :2]
+
+    if ego_mode == "add_xy":
+        offset = np.asarray([ego_x, ego_y], dtype=float)
+    elif ego_mode == "add_x_neg_y":
+        offset = np.asarray([ego_x, -ego_y], dtype=float)
+    elif ego_mode == "add_yx":
+        offset = np.asarray([ego_y, ego_x], dtype=float)
+    elif ego_mode == "add_y_neg_x":
+        offset = np.asarray([ego_y, -ego_x], dtype=float)
+    else:
+        raise ValueError(f"Unknown ego_mode: {ego_mode}")
+
+    compensated[:, :2] = compensated[:, :2] + offset
+    return compensated
 
 
 def run_sequence(
@@ -199,6 +253,8 @@ def run_sequence(
     max_age: int,
     min_hits: int,
     max_distance: float,
+    tracker_mode: str = "baseline",
+    ego_mode: str = "none",
 ):
     data_root = Path(data_root)
     seq_dir = data_root / seq
@@ -221,14 +277,25 @@ def run_sequence(
     if seq in ["seq_3", "seq_4"]:
         ego_pos_path = seq_dir / "ego_global_pos.txt"
         ego_motion = ego_pos_distance(ego_pos_path)
+        ego_positions = read_ego_pos(ego_pos_path)
         print(f"ego_global_pos: {ego_pos_path}")
         print(f"ego motion steps loaded: {len(ego_motion)}")
         print(
             "note: ego motion is loaded; the current baseline uses radar-cluster "
             "association without explicit ego compensation."
         )
+    else:
+        ego_positions = np.zeros((0, 3), dtype=float)
 
-    tracker = Tracker(
+    tracker_classes = {
+        "baseline": Tracker,
+        "kalman": KalmanTracker,
+        "kalman_feature": FeatureKalmanTracker,
+        "kalman_reid": ReIDKalmanTracker,
+        "kalman_low_point_reid": LowPointReIDKalmanTracker,
+    }
+    tracker_cls = tracker_classes[tracker_mode]
+    tracker = tracker_cls(
         max_age=max_age,
         min_hits=min_hits,
         max_distance=max_distance,
@@ -246,6 +313,8 @@ def run_sequence(
     print(f"max_age: {max_age}")
     print(f"min_hits: {min_hits}")
     print(f"max_distance: {max_distance}")
+    print(f"tracker_mode: {tracker_mode}")
+    print(f"ego_mode: {ego_mode}")
     print("note: cluster-level tracking implementation is active.")
 
     for frame_idx, mask_name in enumerate(frame_names):
@@ -261,13 +330,19 @@ def run_sequence(
             moving_radar_pc,
         )
 
-        detections = build_detections(cluster_centroids, cluster_velocities)
+        detections = build_detections(cluster_centroids, cluster_velocities, cluster_points_dict)
+        tracker_detections = apply_ego_translation_compensation(
+            detections=detections,
+            ego_positions=ego_positions,
+            frame_idx=frame_idx,
+            ego_mode=ego_mode,
+        )
 
         confirmed_tracks = np.empty((0, 5), dtype=float)
 
         # TODO-5
         # ================================ TODO: Implementation Starts Here ================================
-        confirmed_tracks = tracker.update(detections)
+        confirmed_tracks = tracker.update(tracker_detections)
         # ================================ TODO: Implementation Ends Here ================================
 
         if save_csv:
@@ -327,7 +402,18 @@ def parse_args():
 
     parser.add_argument("--max-age", type=int, default=5)
     parser.add_argument("--min-hits", type=int, default=1)
-    parser.add_argument("--max-distance", type=float, default=5.0)
+    parser.add_argument("--max-distance", type=float, default=7.0)
+    parser.add_argument(
+        "--tracker-mode",
+        choices=["baseline", "kalman", "kalman_feature", "kalman_reid", "kalman_low_point_reid"],
+        default="baseline",
+    )
+    parser.add_argument(
+        "--ego-mode",
+        choices=["none", "add_xy", "add_x_neg_y", "add_yx", "add_y_neg_x"],
+        default="none",
+        help="Track in an approximate ego-translation-compensated coordinate frame.",
+    )
 
     return parser.parse_args()
 
@@ -344,4 +430,6 @@ if __name__ == "__main__":
         max_age=args.max_age,
         min_hits=args.min_hits,
         max_distance=args.max_distance,
+        tracker_mode=args.tracker_mode,
+        ego_mode=args.ego_mode,
     )
