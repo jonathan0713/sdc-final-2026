@@ -63,6 +63,53 @@ def frame_xy(coords: dict[int, dict[str, np.ndarray]], frame_id: int) -> np.ndar
     return np.column_stack([axes["x"], axes["y"]])
 
 
+def read_ego_positions(path: str | Path | None) -> np.ndarray:
+    if path is None:
+        return np.zeros((0, 3), dtype=float)
+
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Missing ego pose file: {path}")
+
+    positions = []
+
+    with path.open("r") as f:
+        for line in f:
+            if not line.strip() or line.startswith("#"):
+                continue
+
+            parts = line.split()
+
+            if len(parts) < 4:
+                continue
+
+            positions.append([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    return np.asarray(positions, dtype=float)
+
+
+def ego_offset(ego_positions: np.ndarray, frame_id: int, ego_mode: str) -> np.ndarray:
+    if ego_mode == "none" or len(ego_positions) == 0 or frame_id >= len(ego_positions):
+        return np.zeros(2, dtype=float)
+
+    ego_x, ego_y = ego_positions[frame_id, :2]
+
+    if ego_mode == "add_xy":
+        return np.asarray([ego_x, ego_y], dtype=float)
+
+    if ego_mode == "add_x_neg_y":
+        return np.asarray([ego_x, -ego_y], dtype=float)
+
+    if ego_mode == "add_yx":
+        return np.asarray([ego_y, ego_x], dtype=float)
+
+    if ego_mode == "add_y_neg_x":
+        return np.asarray([ego_y, -ego_x], dtype=float)
+
+    raise ValueError(f"Unknown ego_mode: {ego_mode}")
+
+
 def split_observations(
     track_id: int,
     observations: list[dict],
@@ -99,8 +146,11 @@ def build_tracklets(
     coords: dict[int, dict[str, np.ndarray]],
     split_gap: int = 0,
     split_jump_distance: float = 0.0,
+    ego_positions: np.ndarray | None = None,
+    ego_mode: str = "none",
 ) -> dict[int, dict]:
     observations = defaultdict(list)
+    ego_positions = np.zeros((0, 3), dtype=float) if ego_positions is None else ego_positions
 
     for frame_id in sorted(masks):
         mask = masks[frame_id]
@@ -109,6 +159,8 @@ def build_tracklets(
         if xy is None or len(xy) != len(mask):
             continue
 
+        tracking_xy = xy + ego_offset(ego_positions, frame_id, ego_mode)
+
         for track_id in np.unique(mask[mask >= 0]):
             track_id = int(track_id)
             idx = mask == track_id
@@ -116,7 +168,7 @@ def build_tracklets(
                 {
                     "frame": frame_id,
                     "count": int(idx.sum()),
-                    "xy": xy[idx].mean(axis=0),
+                    "xy": tracking_xy[idx].mean(axis=0),
                 }
             )
 
@@ -321,17 +373,26 @@ def parse_args():
     parser.add_argument("--max-velocity-diff", type=float, default=0.0, help="0 disables this filter.")
     parser.add_argument("--velocity-weight", type=float, default=0.0)
     parser.add_argument("--cross-id-only", action="store_true")
+    parser.add_argument("--ego-pos", default=None)
+    parser.add_argument(
+        "--ego-mode",
+        choices=["none", "add_xy", "add_x_neg_y", "add_yx", "add_y_neg_x"],
+        default="none",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     masks, coords = load_result_csv(args.input)
+    ego_positions = read_ego_positions(args.ego_pos)
     tracklets = build_tracklets(
         masks,
         coords,
         split_gap=args.split_gap,
         split_jump_distance=args.split_jump_distance,
+        ego_positions=ego_positions,
+        ego_mode=args.ego_mode,
     )
     pairs = find_merge_pairs(
         tracklets,
