@@ -195,7 +195,7 @@ def parse_args():
     parser.add_argument(
         "--tracker-modes",
         nargs="+",
-        choices=["baseline", "kalman", "kalman_feature", "kalman_reid", "kalman_low_point_reid"],
+        choices=["baseline", "kalman", "kalman_feature", "kalman_rr", "kalman_reid", "kalman_feature_reid", "kalman_low_point_reid"],
         default=["baseline"],
     )
     parser.add_argument(

@@ -257,6 +257,7 @@ class KalmanTracker:
             track["age"] = 0
             track["state"] = "confirmed" if track["hits"] >= self.min_hits else "tentative"
             track["det"] = detection
+            track["last_measured_xy"] = detection[:2].astype(float)
             track["updated"] = True
             track["prev_states"].append(track["x"][:2].copy())
 
@@ -371,6 +372,258 @@ class KalmanTracker:
 
         for track_idx, detection_idx in zip(row_indices, col_indices):
             if cost[track_idx, detection_idx] >= 1e6:
+                continue
+
+            matched.append((int(track_idx), int(detection_idx)))
+            matched_track_indices.add(int(track_idx))
+            matched_detection_indices.add(int(detection_idx))
+
+        unmatched_detections = [
+            detection_idx for detection_idx in range(len(detections)) if detection_idx not in matched_detection_indices
+        ]
+        unmatched_tracks = [
+            track_idx
+            for track_idx, track in enumerate(self.tracks)
+            if track_idx not in matched_track_indices and track["state"] != "deleted"
+        ]
+
+        return matched, unmatched_detections, unmatched_tracks
+
+
+class RangeRateKalmanTracker:
+    def __init__(
+        self,
+        max_age: int = 10,
+        min_hits: int = 1,
+        max_distance: float = 4.0,
+        max_euclidean: float = 5.5,
+        dt: float = 0.1,
+        q_var: float = 100.0,
+        q_var_lat: float = 10.0,
+        r_var: float = 300.0,
+        p_var: float = 100.0,
+        r_var_vel: float = 5.0,
+        range_rate_sigma: float = 10.0,
+        y_cost_weight: float = 0.5,
+        rr_vel_gate: float = 5.0,
+        rr_spawn_min_pts: int = 3,
+    ):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.max_distance = max_distance
+        self.max_euclidean = max_euclidean
+        self.range_rate_sigma = range_rate_sigma
+        self.y_cost_weight = y_cost_weight
+        self.rr_vel_gate = rr_vel_gate
+        self.rr_spawn_min_pts = rr_spawn_min_pts
+        self.r_var_vel = r_var_vel
+        self.next_track_id = 0
+        self.tracks = []
+
+        self.f = np.asarray(
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        self.h = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        )
+        self.q = np.diag([q_var, q_var_lat, q_var, q_var_lat]).astype(float)
+        self.r = np.eye(2, dtype=float) * r_var
+        self.p0 = np.eye(4, dtype=float) * p_var
+        self.p0[2, 2] = p_var * 10.0
+        self.p0[3, 3] = p_var * 10.0 * (q_var_lat / max(q_var, 1e-12))
+
+    def update(self, detections: np.ndarray) -> np.ndarray:
+        if detections is None or len(detections) == 0:
+            detections = np.empty((0, 5), dtype=float)
+
+        for track in self.tracks:
+            track["updated"] = False
+            self.predict_track(track)
+
+        matched, unmatched_detections, unmatched_tracks = self.match_tracks(detections)
+
+        for track_idx, detection_idx in matched:
+            track = self.tracks[track_idx]
+            detection = detections[detection_idx]
+            self.update_track(track, detection)
+
+            track["hits"] += 1
+            track["age"] = 0
+            track["state"] = "confirmed" if track["hits"] >= self.min_hits else "tentative"
+            track["det"] = detection
+            track["last_measured_xy"] = detection[:2].astype(float)
+            track["updated"] = True
+            track["prev_states"].append(track["x"][:2].copy())
+
+        for detection_idx in unmatched_detections:
+            detection = detections[detection_idx]
+            x = np.zeros(4, dtype=float)
+            x[:2] = detection[:2]
+            x[2:] = self.initial_velocity(detection)
+            prev_states = deque(maxlen=MAX_TRAJ)
+            prev_states.append(x[:2].copy())
+            state = "confirmed" if self.min_hits <= 1 else "tentative"
+
+            self.tracks.append(
+                {
+                    "x": x,
+                    "p": self.p0.copy(),
+                    "track_id": self.next_track_id,
+                    "hits": 1,
+                    "age": 0,
+                    "state": state,
+                    "det": detection,
+                    "updated": True,
+                    "prev_states": prev_states,
+                }
+            )
+            self.next_track_id += 1
+
+        for track_idx in unmatched_tracks:
+            if track_idx >= len(self.tracks):
+                continue
+
+            track = self.tracks[track_idx]
+            track["age"] += 1
+
+            if track["age"] > self.max_age:
+                track["state"] = "deleted"
+
+        self.tracks = [track for track in self.tracks if track["state"] != "deleted"]
+
+        confirmed_tracks = []
+        for track in self.tracks:
+            if track["state"] != "confirmed" or not track.get("updated", False):
+                continue
+
+            det = track["det"]
+            confirmed_tracks.append(
+                [
+                    float(track["x"][0]),
+                    float(track["x"][1]),
+                    float(det[2]),
+                    int(det[3]),
+                    int(track["track_id"]),
+                ]
+            )
+
+        return np.asarray(confirmed_tracks, dtype=float)
+
+    def initial_velocity(self, detection: np.ndarray) -> np.ndarray:
+        pos = detection[:2].astype(float)
+        rr = float(detection[4])
+        radius = float(np.linalg.norm(pos))
+        point_count = detection_point_count(detection)
+        sparse = self.rr_spawn_min_pts > 0 and point_count < self.rr_spawn_min_pts
+        noisy_rr = self.rr_vel_gate > 0 and abs(rr) > self.rr_vel_gate
+
+        if sparse and noisy_rr:
+            return np.zeros(2, dtype=float)
+
+        if radius <= 1e-6:
+            return np.zeros(2, dtype=float)
+
+        return (rr / radius) * pos
+
+    def predict_track(self, track: dict) -> None:
+        track["x"] = self.f @ track["x"]
+        track["p"] = self.f @ track["p"] @ self.f.T + self.q
+
+    def predicted_range_rate(self, track: dict) -> float:
+        pos = track["x"][:2]
+        vel = track["x"][2:]
+        radius = float(np.linalg.norm(pos))
+
+        if radius <= 1e-6:
+            return 0.0
+
+        return float((vel[0] * pos[0] + vel[1] * pos[1]) / radius)
+
+    def update_track(self, track: dict, detection: np.ndarray) -> None:
+        use_rr = True
+
+        if self.rr_vel_gate > 0:
+            use_rr = abs(float(detection[4]) - self.predicted_range_rate(track)) <= self.rr_vel_gate
+
+        if use_rr:
+            pos = track["x"][:2]
+            radius = float(np.linalg.norm(pos))
+            cos_t, sin_t = (float(pos[0]) / radius, float(pos[1]) / radius) if radius > 1e-6 else (1.0, 0.0)
+            h = np.asarray(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, cos_t, sin_t],
+                ],
+                dtype=float,
+            )
+            r = np.diag([self.r[0, 0], self.r[1, 1], self.r_var_vel]).astype(float)
+            z = np.asarray([detection[0], detection[1], detection[4]], dtype=float)
+        else:
+            h = self.h
+            r = self.r
+            z = detection[:2].astype(float)
+
+        innovation = z - h @ track["x"]
+        s = h @ track["p"] @ h.T + r
+        k = track["p"] @ h.T @ np.linalg.inv(s)
+        track["x"] = track["x"] + k @ innovation
+        identity = np.eye(4, dtype=float)
+        track["p"] = (identity - k @ h) @ track["p"]
+
+    def match_tracks(self, detections: np.ndarray):
+        matched = []
+        unmatched_detections = list(range(len(detections)))
+        unmatched_tracks = list(range(len(self.tracks)))
+
+        if len(detections) == 0 or len(self.tracks) == 0:
+            return matched, unmatched_detections, unmatched_tracks
+
+        cost = np.full((len(self.tracks), len(detections)), fill_value=1e9, dtype=float)
+
+        for track_idx, track in enumerate(self.tracks):
+            if track["state"] == "deleted":
+                continue
+
+            predicted_xy = track["x"][:2]
+            s = self.h @ track["p"] @ self.h.T
+            s_inv = np.linalg.inv(s)
+            previous_det = np.asarray(track.get("det", np.zeros(5, dtype=float)), dtype=float)
+
+            for detection_idx, detection in enumerate(detections):
+                diff = detection[:2] - predicted_xy
+                euclidean = float(np.linalg.norm(diff))
+
+                if euclidean > self.max_euclidean:
+                    continue
+
+                mahalanobis = float(np.sqrt(diff.T @ s_inv @ diff))
+
+                if mahalanobis > self.max_distance:
+                    continue
+
+                rr_cost = abs(float(detection[4]) - float(previous_det[4])) / max(self.range_rate_sigma, 1e-6)
+                y_cost = abs(float(detection[1]) - float(predicted_xy[1])) * self.y_cost_weight
+                cost[track_idx, detection_idx] = mahalanobis + rr_cost + y_cost
+
+        row_indices, col_indices = linear_sum_assignment(cost)
+
+        matched = []
+        matched_track_indices = set()
+        matched_detection_indices = set()
+
+        for track_idx, detection_idx in zip(row_indices, col_indices):
+            if cost[track_idx, detection_idx] >= 1e9:
                 continue
 
             matched.append((int(track_idx), int(detection_idx)))
@@ -529,6 +782,7 @@ class ReIDKalmanTracker(KalmanTracker):
             track["age"] = 0
             track["state"] = "confirmed" if track["hits"] >= self.min_hits else "tentative"
             track["det"] = detection
+            track["last_measured_xy"] = detection[:2].astype(float)
             track["updated"] = True
             track["prev_states"].append(track["x"][:2].copy())
 
@@ -548,6 +802,7 @@ class ReIDKalmanTracker(KalmanTracker):
                     lost_track["lost_age"] = 0
                     lost_track["updated"] = False
                     lost_track["state"] = "lost"
+                    lost_track.setdefault("last_measured_xy", np.asarray(track["det"][:2], dtype=float))
                     deleted_tracks.append(lost_track)
 
         self.lost_tracks.extend(deleted_tracks)
@@ -569,6 +824,7 @@ class ReIDKalmanTracker(KalmanTracker):
             lost_track["age"] = 0
             lost_track["state"] = "confirmed"
             lost_track["det"] = detection
+            lost_track["last_measured_xy"] = detection[:2].astype(float)
             lost_track["updated"] = True
             lost_track["prev_states"].append(lost_track["x"][:2].copy())
             lost_track.pop("lost_age", None)
@@ -597,6 +853,7 @@ class ReIDKalmanTracker(KalmanTracker):
                     "age": 0,
                     "state": state,
                     "det": detection,
+                    "last_measured_xy": detection[:2].astype(float),
                     "updated": True,
                     "prev_states": prev_states,
                 }
@@ -652,6 +909,124 @@ class ReIDKalmanTracker(KalmanTracker):
                     + 0.1 * xy_distance
                     + 0.1 * z_distance
                     + 0.05 * rr_distance
+                    + 0.03 * lost_age
+                )
+
+        row_indices, col_indices = linear_sum_assignment(cost)
+
+        matched = []
+        matched_lost_indices = set()
+        matched_detection_indices = set()
+
+        for lost_idx, col_idx in zip(row_indices, col_indices):
+            if cost[lost_idx, col_idx] >= 1e6:
+                continue
+
+            detection_idx = int(detection_indices[col_idx])
+            matched.append((int(lost_idx), detection_idx))
+            matched_lost_indices.add(int(lost_idx))
+            matched_detection_indices.add(detection_idx)
+
+        remaining_unmatched_detections = [
+            detection_idx for detection_idx in detection_indices if detection_idx not in matched_detection_indices
+        ]
+
+        return matched, remaining_unmatched_detections, matched_lost_indices
+
+
+class FeatureReIDKalmanTracker(ReIDKalmanTracker):
+    def match_tracks(self, detections: np.ndarray):
+        matched = []
+        unmatched_detections = list(range(len(detections)))
+        unmatched_tracks = list(range(len(self.tracks)))
+
+        if len(detections) == 0 or len(self.tracks) == 0:
+            return matched, unmatched_detections, unmatched_tracks
+
+        cost = np.full((len(self.tracks), len(detections)), fill_value=1e6, dtype=float)
+
+        for track_idx, track in enumerate(self.tracks):
+            if track["state"] == "deleted":
+                continue
+
+            predicted_xy = track["x"][:2]
+            previous_det = np.asarray(track.get("det", np.zeros(FEATURE_START + FEATURE_DIM, dtype=float)), dtype=float)
+            s = self.h @ track["p"] @ self.h.T + self.r
+            s_inv = np.linalg.inv(s)
+
+            for detection_idx, detection in enumerate(detections):
+                innovation = detection[:2] - predicted_xy
+                xy_distance = np.linalg.norm(innovation)
+
+                if xy_distance > self.max_distance:
+                    continue
+
+                mahalanobis_distance = float(np.sqrt(innovation.T @ s_inv @ innovation))
+                z_distance = abs(float(detection[2]) - float(previous_det[2]))
+                rr_distance = abs(float(detection[4]) - float(previous_det[4]))
+
+                cost[track_idx, detection_idx] = (
+                    mahalanobis_distance
+                    + 0.1 * xy_distance
+                    + 0.1 * z_distance
+                    + 0.05 * rr_distance
+                    + cluster_feature_cost(detection, previous_det)
+                )
+
+        row_indices, col_indices = linear_sum_assignment(cost)
+
+        matched = []
+        matched_track_indices = set()
+        matched_detection_indices = set()
+
+        for track_idx, detection_idx in zip(row_indices, col_indices):
+            if cost[track_idx, detection_idx] >= 1e6:
+                continue
+
+            matched.append((int(track_idx), int(detection_idx)))
+            matched_track_indices.add(int(track_idx))
+            matched_detection_indices.add(int(detection_idx))
+
+        unmatched_detections = [
+            detection_idx for detection_idx in range(len(detections)) if detection_idx not in matched_detection_indices
+        ]
+        unmatched_tracks = [
+            track_idx
+            for track_idx, track in enumerate(self.tracks)
+            if track_idx not in matched_track_indices and track["state"] != "deleted"
+        ]
+
+        return matched, unmatched_detections, unmatched_tracks
+
+    def match_lost_tracks(self, detections: np.ndarray, detection_indices: list[int]):
+        if len(self.lost_tracks) == 0 or len(detection_indices) == 0:
+            return [], detection_indices, set()
+
+        cost = np.full((len(self.lost_tracks), len(detection_indices)), fill_value=1e6, dtype=float)
+
+        for lost_idx, track in enumerate(self.lost_tracks):
+            reid_xy = np.asarray(
+                track.get("last_measured_xy", track["x"][:2]),
+                dtype=float,
+            )
+            previous_det = np.asarray(track.get("det", np.zeros(FEATURE_START + FEATURE_DIM, dtype=float)), dtype=float)
+
+            for col_idx, detection_idx in enumerate(detection_indices):
+                detection = detections[detection_idx]
+                xy_distance = float(np.linalg.norm(detection[:2] - reid_xy))
+
+                if xy_distance > self.max_distance:
+                    continue
+
+                z_distance = abs(float(detection[2]) - float(previous_det[2]))
+                rr_distance = abs(float(detection[4]) - float(previous_det[4]))
+                lost_age = float(track.get("lost_age", 0))
+
+                cost[lost_idx, col_idx] = (
+                    xy_distance
+                    + 0.1 * z_distance
+                    + 0.05 * rr_distance
+                    + cluster_feature_cost(detection, previous_det)
                     + 0.03 * lost_age
                 )
 

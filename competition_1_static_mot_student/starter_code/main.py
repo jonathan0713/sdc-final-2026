@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sdc_tracker import FeatureKalmanTracker, KalmanTracker, LowPointReIDKalmanTracker, ReIDKalmanTracker, Tracker
+from sdc_tracker import FeatureKalmanTracker, FeatureReIDKalmanTracker, KalmanTracker, LowPointReIDKalmanTracker, RangeRateKalmanTracker, ReIDKalmanTracker, Tracker
 from sdc_tracking_utils import (
     ego_pos_distance,
     list_frame_names,
@@ -256,7 +256,9 @@ def run_sequence(
         "baseline": Tracker,
         "kalman": KalmanTracker,
         "kalman_feature": FeatureKalmanTracker,
+        "kalman_rr": RangeRateKalmanTracker,
         "kalman_reid": ReIDKalmanTracker,
+        "kalman_feature_reid": FeatureReIDKalmanTracker,
         "kalman_low_point_reid": LowPointReIDKalmanTracker,
     }
     tracker_cls = tracker_classes[tracker_mode]
@@ -363,7 +365,7 @@ def parse_args():
     parser.add_argument("--max-distance", type=float, default=7.0)
     parser.add_argument(
         "--tracker-mode",
-        choices=["baseline", "kalman", "kalman_feature", "kalman_reid", "kalman_low_point_reid"],
+        choices=["baseline", "kalman", "kalman_feature", "kalman_rr", "kalman_reid", "kalman_feature_reid", "kalman_low_point_reid"],
         default="baseline",
     )
 
